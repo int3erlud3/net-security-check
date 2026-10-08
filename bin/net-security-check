@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2317  # check_* functions and their helpers are called indirectly ("check_$name")
+# net-security-check - read-only network diagnostics and exposure audit for Linux hosts:
+# DNS, routes, MTU / path MTU, listening ports with owning processes, services exposed
+# on all interfaces, firewall summary (nftables / iptables / ufw / firewalld), TLS
+# endpoints and sysctl network hardening. Changes nothing on the system.
+set -euo pipefail
+umask 077
+
+readonly VERSION="1.0.0"
+readonly PROG="${0##*/}"
+
+# Read paths (overridable for tests or for auditing a mounted image)
+PROC_SYS="${NSC_PROC_SYS:-/proc/sys}"
+RESOLV_CONF="${NSC_RESOLV_CONF:-/etc/resolv.conf}"
+
+ALL_CHECKS="dns routes mtu ports exposure firewall tls sysctl"
+CHECKS="$ALL_CHECKS"
+FORMAT="text"
+DNS_NAME=""
+TARGET=""
+TLS_TARGETS=()
+ALLOW_PORTS="22/tcp,68/udp,546/udp"
+ALLOW_FORWARDING=0
+TIMEOUT=5
+CERT_WARN_DAYS=21
+SHOW_BANNER=1
+
+# Wildcard-exposed ports that are almost never meant to be reachable from a network.
+CRIT_PORTS=" 23 512 513 514 2375 5900 6379 9200 11211 27017 "
+# Database / file sharing / management ports that deserve a closer look.
+RISKY_PORTS=" 21 111 135 139 445 1433 1521 2049 3306 3389 5432 5984 8080 8443 9090 10250 "
+
+# ---- banner (cosmetic: stderr only, interactive terminals only) -----------
+# Bastion Ops Toolkit banner. Disable with --no-banner or NO_BANNER=1. Not shown when
+# stderr is not a terminal (cron, pipes, systemd, monitoring agents).
+banner_enabled() {
+  (( SHOW_BANNER )) || return 1
+  [[ -z ${NO_BANNER:-} || ${NO_BANNER} == 0 ]] || return 1
+  [[ -t 2 ]]
+}
+
+print_banner() {
+  banner_enabled || return 0
+  {
+    cat <<'WORDMARK'
+            _                           _ _
+   _ _  ___| |_ ___ ___ ___ __ _  _ _ _(_) |_ _  _
+  | ' \/ -_)  _|___(_-</ -_) _| || | '_| |  _| || |
+  |_||_\___|\__|   /__/\___\__|\_,_|_| |_|\__|\_, |
+                                              |__/
+      _           _
+   __| |_  ___ __| |__
+  / _| ' \/ -_) _| / /
+  \__|_||_\___\__|_\_\
+
++====================================================================+
+|  NET SECURITY CHECK  ::  Network Diagnostics & Exposure Audit      |
++--------------------------------------------------------------------+
+|  DNS, routes, MTU, listeners, firewall, TLS and sysctl hardening   |
+WORDMARK
+    printf '|  %-64s  |\n' "v$VERSION  -  Bastion Ops Toolkit  -  by int3erlud3"
+    printf '%s\n\n' '+====================================================================+'
+  } >&2 || true
+}
+
+usage() {
+  cat <<USAGE
+Usage: $PROG [options]
+
+Read-only network diagnostics and exposure audit. Run as root for complete
+process ownership and firewall details.
+
+Options:
+  --checks LIST         comma-separated subset of: ${ALL_CHECKS// /,}
+  --allow-ports LIST    ports expected on all interfaces, PORT[/tcp|/udp]
+                        (default: $ALLOW_PORTS)
+  --dns-name NAME       resolve NAME to test DNS (default: configuration check only)
+  --target HOST         probe the path MTU towards HOST (ping with DF bit)
+  --tls HOST:PORT       check a TLS endpoint (repeatable)
+  --cert-warn-days N    warn when a certificate expires within N days (default $CERT_WARN_DAYS)
+  --allow-forwarding    host is a router/container host: IP forwarding is expected
+  --timeout SEC         timeout for network probes (default $TIMEOUT)
+  --format text|json    output format (default text)
+  --no-banner           do not print the banner (or set NO_BANNER=1)
+  -h, --help            show this help
+  -V, --version         show version
+
+Exit codes: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN (usage error)
+USAGE
+}
+
+die() {
+  printf '%s: error: %s\n' "$PROG" "$1" >&2
+  exit 3
+}
+
+need_arg() { [[ $# -ge 2 && -n $2 ]] || die "option $1 requires an argument"; }
+
+valid_host() { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$ ]]; }
+
+parse_args() {
+  for arg in "$@"; do
+    [[ $arg == --no-banner ]] && SHOW_BANNER=0
+  done
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --checks) need_arg "$@"; CHECKS=${2//,/ }; shift ;;
+      --allow-ports) need_arg "$@"; ALLOW_PORTS=$2; shift ;;
+      --dns-name) need_arg "$@"; DNS_NAME=$2; shift ;;
+      --target) need_arg "$@"; TARGET=$2; shift ;;
+      --tls) need_arg "$@"; TLS_TARGETS+=("$2"); shift ;;
+      --cert-warn-days) need_arg "$@"; CERT_WARN_DAYS=$2; shift ;;
+      --allow-forwarding) ALLOW_FORWARDING=1 ;;
+      --timeout) need_arg "$@"; TIMEOUT=$2; shift ;;
+      --format) need_arg "$@"; FORMAT=$2; shift ;;
+      --no-banner) SHOW_BANNER=0 ;;
+      -h | --help) print_banner; usage; exit 0 ;;
+      -V | --version) print_banner; printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+      *) usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+  done
+}
+
+validate_args() {
+  local c p t
+  [[ $FORMAT == text || $FORMAT == json ]] || die "--format must be text or json"
+  for c in $CHECKS; do
+    [[ " $ALL_CHECKS " == *" $c "* ]] || die "unknown check: $c"
+  done
+  [[ $ALLOW_PORTS =~ ^([0-9]{1,5}(/(tcp|udp))?(,[0-9]{1,5}(/(tcp|udp))?)*)?$ ]] || die "invalid --allow-ports"
+  for p in ${ALLOW_PORTS//,/ }; do
+    (( 10#${p%%/*} >= 1 && 10#${p%%/*} <= 65535 )) || die "port out of range: $p"
+  done
+  [[ -z $DNS_NAME ]] || valid_host "$DNS_NAME" || die "invalid --dns-name"
+  [[ -z $TARGET ]] || valid_host "$TARGET" || die "invalid --target"
+  for t in "${TLS_TARGETS[@]}"; do
+    if [[ ! $t =~ ^([A-Za-z0-9][A-Za-z0-9.-]{0,252}):([0-9]{1,5})$ ]] || (( BASH_REMATCH[2] < 1 || BASH_REMATCH[2] > 65535 )); then
+      die "invalid --tls target (HOST:PORT): $t"
+    fi
+  done
+  if [[ ! $TIMEOUT =~ ^[0-9]{1,3}$ ]] || (( TIMEOUT < 1 )); then
+    die "--timeout must be 1-999 seconds"
+  fi
+  [[ $CERT_WARN_DAYS =~ ^[0-9]{1,4}$ ]] || die "--cert-warn-days must be a number"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- findings ------------------------------------------------------------------
+F_CHECK=() F_SEV=() F_MSG=()
+L_PROTO=() L_ADDR=() L_PORT=() L_PROC=() L_SCOPE=()
+
+add() { F_CHECK+=("$1"); F_SEV+=("$2"); F_MSG+=("$3"); }
+
+sev_rank() {
+  case $1 in OK) echo 0 ;; INFO) echo 0 ;; WARN) echo 1 ;; CRIT) echo 2 ;; *) echo 0 ;; esac
+}
+
+check_status() { # worst severity of a check
+  local i worst=OK
+  for i in "${!F_CHECK[@]}"; do
+    [[ ${F_CHECK[i]} == "$1" ]] || continue
+    if (( $(sev_rank "${F_SEV[i]}") > $(sev_rank "$worst") )); then worst=${F_SEV[i]}; fi
+  done
+  echo "$worst"
+}
+
+# ---- checks ----------------------------------------------------------------------
+check_dns() {
+  if [[ ! -r $RESOLV_CONF ]]; then
+    add dns CRIT "$RESOLV_CONF missing or unreadable"
+    return
+  fi
+  local ns search
+  ns=$(awk '$1 == "nameserver" { printf "%s ", $2 }' "$RESOLV_CONF")
+  ns=${ns% }
+  search=$(awk '$1 == "search" || $1 == "domain" { $1 = ""; sub(/^ /, ""); print; exit }' "$RESOLV_CONF")
+  local count=0
+  [[ -z $ns ]] || count=$(wc -w <<<"$ns")
+  if (( count == 0 )); then
+    add dns CRIT "no nameserver configured in $RESOLV_CONF"
+  elif [[ $ns == "127.0.0.53" ]]; then
+    add dns OK "systemd-resolved stub resolver (127.0.0.53); upstream servers: resolvectl status"
+  elif (( count == 1 )); then
+    add dns WARN "only one nameserver ($ns): no redundancy"
+  else
+    add dns OK "$count nameservers: $ns"
+  fi
+  [[ -z $search ]] || add dns INFO "search domains: $search"
+  if [[ -n $DNS_NAME ]]; then
+    local res
+    if res=$(timeout "$TIMEOUT" getent ahosts "$DNS_NAME" 2>/dev/null | awk '{ print $1 }' | sort -u | paste -sd' ' -) && [[ -n $res ]]; then
+      add dns OK "$DNS_NAME resolves to $res"
+    else
+      add dns CRIT "cannot resolve $DNS_NAME within ${TIMEOUT}s"
+    fi
+  fi
+}
+
+check_routes() {
+  have ip || { add routes INFO "ip (iproute2) not available"; return; }
+  local v4 v6 n
+  v4=$(ip -4 route show default 2>/dev/null || true)
+  v6=$(ip -6 route show default 2>/dev/null || true)
+  if [[ -z $v4 ]]; then
+    add routes WARN "no IPv4 default route"
+  else
+    n=$(grep -c . <<<"$v4")
+    while read -r line; do
+      add routes OK "IPv4 default: ${line#default }"
+    done <<<"$v4"
+    if (( n > 1 )) && [[ $(awk '{ for (i = 1; i < NF; i++) if ($i == "metric") print $(i+1); }' <<<"$v4" | sort | uniq -d) != "" || $(grep -c metric <<<"$v4") -lt $n ]]; then
+      add routes WARN "$n IPv4 default routes with equal metric: traffic may take an unexpected path"
+    fi
+  fi
+  [[ -z $v6 ]] || add routes INFO "IPv6 default: $(head -n1 <<<"$v6" | sed 's/^default //')"
+}
+
+check_mtu() {
+  have ip || { add mtu INFO "ip (iproute2) not available"; return; }
+  local line ifname mtu
+  while read -r line; do
+    [[ $line =~ ^[0-9]+:\ ([^:@]+)(@[^:]+)?:.*\ mtu\ ([0-9]+) ]] || continue
+    ifname=${BASH_REMATCH[1]} mtu=${BASH_REMATCH[3]}
+    [[ $ifname == lo ]] && continue
+    if [[ $line == *",UP"* || $line == *"<UP"* ]]; then
+      if (( mtu < 1280 )); then
+        add mtu WARN "$ifname mtu $mtu is below the IPv6 minimum (1280)"
+      elif (( mtu != 1500 )); then
+        add mtu INFO "$ifname mtu $mtu"
+      else
+        add mtu OK "$ifname mtu $mtu"
+      fi
+    fi
+  done < <(ip -o link show 2>/dev/null || true)
+  [[ -n $TARGET ]] || return 0
+  have ping || { add mtu INFO "ping not available: path MTU not probed"; return; }
+  local lo=548 hi=1472 mid best=0
+  if ! timeout "$TIMEOUT" ping -c 1 -W 2 -M "do" -s "$lo" "$TARGET" >/dev/null 2>&1; then
+    add mtu WARN "path MTU probe to $TARGET failed (host unreachable or ICMP filtered)"
+    return
+  fi
+  best=$lo
+  while (( lo <= hi )); do
+    mid=$(((lo + hi) / 2))
+    if timeout "$TIMEOUT" ping -c 1 -W 2 -M "do" -s "$mid" "$TARGET" >/dev/null 2>&1; then
+      best=$mid lo=$((mid + 1))
+    else
+      hi=$((mid - 1))
+    fi
+  done
+  local pmtu=$((best + 28))
+  if (( pmtu < 1500 )); then
+    add mtu WARN "path MTU to $TARGET is $pmtu (< 1500): check tunnels/VPN and MSS clamping"
+  else
+    add mtu OK "path MTU to $TARGET is $pmtu"
+  fi
+}
+
+# Fills L_* arrays from "ss -H -tulpn".
+collect_listeners() {
+  (( ${#L_PORT[@]} == 0 )) || return 0
+  have ss || return 1
+  local netid state recvq sendq local_addr peer rest addr port proc
+  while read -r netid state recvq sendq local_addr peer rest; do
+    [[ $netid == tcp || $netid == udp ]] || continue
+    [[ $state == LISTEN || $state == UNCONN ]] || continue
+    port=${local_addr##*:}
+    addr=${local_addr%:*}
+    addr=${addr%%%*}
+    proc="-"
+    [[ $rest =~ \(\(\"([^\"]+)\",pid=([0-9]+) ]] && proc="${BASH_REMATCH[1]}[${BASH_REMATCH[2]}]"
+    L_PROTO+=("$netid") L_ADDR+=("$addr") L_PORT+=("$port") L_PROC+=("$proc")
+    case $addr in
+      0.0.0.0 | "[::]" | "*" | "::") L_SCOPE+=(all) ;;
+      127.* | "[::1]" | "::1") L_SCOPE+=(loopback) ;;
+      *) L_SCOPE+=(address) ;;
+    esac
+  done < <(ss -H -tulpn 2>/dev/null)
+  : "$state" "$recvq" "$sendq" "$peer"
+}
+
+check_ports() {
+  if ! collect_listeners; then
+    add ports INFO "ss (iproute2) not available"
+    return
+  fi
+  local i n=${#L_PORT[@]} all=0 lo=0
+  for i in "${!L_PORT[@]}"; do
+    [[ ${L_SCOPE[i]} == all ]] && all=$((all + 1))
+    [[ ${L_SCOPE[i]} == loopback ]] && lo=$((lo + 1))
+  done
+  add ports OK "$n listening sockets: $all on all interfaces, $lo on loopback, $((n - all - lo)) on specific addresses"
+  if (( EUID != 0 )); then
+    add ports INFO "not running as root: owning processes of other users are not shown"
+  fi
+}
+
+allowed() { # port proto
+  local a
+  for a in ${ALLOW_PORTS//,/ }; do
+    if [[ $a == "$1" || $a == "$1/$2" ]]; then return 0; fi
+  done
+  return 1
+}
+
+check_exposure() {
+  if ! collect_listeners; then
+    add exposure INFO "ss (iproute2) not available"
+    return
+  fi
+  local i port proto found=0
+  for i in "${!L_PORT[@]}"; do
+    [[ ${L_SCOPE[i]} == all ]] || continue
+    port=${L_PORT[i]} proto=${L_PROTO[i]}
+    allowed "$port" "$proto" && continue
+    found=1
+    if [[ $CRIT_PORTS == *" $port "* ]]; then
+      add exposure CRIT "$proto/$port (${L_PROC[i]}) is exposed on all interfaces - service should never be network-reachable"
+    elif [[ $RISKY_PORTS == *" $port "* ]]; then
+      add exposure WARN "$proto/$port (${L_PROC[i]}) is exposed on all interfaces - database/management service"
+    else
+      add exposure WARN "$proto/$port (${L_PROC[i]}) is exposed on all interfaces and not in --allow-ports"
+    fi
+  done
+  (( found )) || add exposure OK "no unexpected services on 0.0.0.0/[::] (allowed: $ALLOW_PORTS)"
+}
+
+check_firewall() {
+  local active=0 out
+  if have firewall-cmd; then
+    out=$(timeout "$TIMEOUT" firewall-cmd --state 2>&1 || true)
+    if [[ $out == running ]]; then
+      active=1
+      local zone target services ports
+      zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "?")
+      out=$(firewall-cmd --list-all --zone="$zone" 2>/dev/null || true)
+      target=$(awk -F': *' '$1 ~ /^ *target$/ { print $2 }' <<<"$out")
+      services=$(awk -F': *' '$1 ~ /^ *services$/ { print $2 }' <<<"$out")
+      ports=$(awk -F': *' '$1 ~ /^ *ports$/ { print $2 }' <<<"$out")
+      if [[ $target == ACCEPT ]]; then
+        add firewall WARN "firewalld running, default zone $zone has target ACCEPT (allows everything)"
+      else
+        add firewall OK "firewalld running, default zone $zone (target ${target:-default}); services: ${services:-none}; ports: ${ports:-none}"
+      fi
+    fi
+  fi
+  if have ufw; then
+    out=$(timeout "$TIMEOUT" ufw status verbose 2>&1 || true)
+    if [[ $out == *"Status: active"* ]]; then
+      active=1
+      local def
+      def=$(sed -n 's/^Default: *//p' <<<"$out")
+      if [[ $def == *"deny (incoming)"* || $def == *"reject (incoming)"* ]]; then
+        add firewall OK "ufw active ($def), $(grep -cE '(ALLOW|DENY|REJECT|LIMIT)' <<<"$out") rules"
+      else
+        add firewall WARN "ufw active but incoming default is not deny: $def"
+      fi
+    elif [[ $out == *"must be root"* || $out == *"ermission"* ]]; then
+      add firewall INFO "ufw installed: run as root to read its status"
+    fi
+  fi
+  if have nft; then
+    if out=$(timeout "$TIMEOUT" nft list ruleset 2>&1); then
+      if [[ -n $out ]]; then
+        local policies chains
+        chains=$(grep -cE 'hook input' <<<"$out" || true)
+        policies=$(grep -E 'hook input' <<<"$out" | sed -nE 's/.*policy ([a-z]+);.*/\1/p' | sort -u | paste -sd, -)
+        if (( chains > 0 )); then
+          active=1
+          if [[ $policies == *drop* ]]; then
+            add firewall OK "nftables: $chains input chain(s), policy $policies, $(grep -cE '^\s+(ip|ip6|tcp|udp|iif|ct|meta|counter|accept|drop|reject|jump)' <<<"$out") rules"
+          elif grep -qE '^\s+.*\b(drop|reject)\b' <<<"$out"; then
+            add firewall OK "nftables: input policy ${policies:-accept} with explicit drop/reject rules"
+          else
+            add firewall WARN "nftables: input chain(s) with policy ${policies:-accept} and no drop/reject rules"
+          fi
+        fi
+      fi
+    elif [[ $out == *"ermission"* || $out == *"not permitted"* ]]; then
+      add firewall INFO "nftables: run as root to read the ruleset"
+    fi
+  fi
+  if have iptables; then
+    if out=$(timeout "$TIMEOUT" iptables -S INPUT 2>&1); then
+      local pol rules
+      pol=$(sed -n 's/^-P INPUT //p' <<<"$out")
+      rules=$(grep -c '^-A INPUT' <<<"$out" || true)
+      if [[ $pol == DROP ]]; then
+        active=1
+        add firewall OK "iptables: INPUT policy DROP, $rules rules"
+      elif grep -qE '^-A INPUT.*-j (DROP|REJECT)' <<<"$out"; then
+        active=1
+        add firewall OK "iptables: INPUT policy $pol with explicit DROP/REJECT rules ($rules rules)"
+      elif (( rules > 0 )); then
+        add firewall INFO "iptables: INPUT policy $pol, $rules rules without a final DROP/REJECT"
+      fi
+    elif [[ $out == *"ermission"* || $out == *"must be root"* ]]; then
+      add firewall INFO "iptables: run as root to read the rules"
+    fi
+  fi
+  if (( ! active )); then
+    if (( EUID != 0 )); then
+      add firewall WARN "no active host firewall detected (run as root for a reliable result)"
+    else
+      add firewall WARN "no active host firewall (nftables, iptables, ufw or firewalld) with a restrictive input policy"
+    fi
+  fi
+}
+
+check_tls_target() {
+  local target=$1 host=${1%:*} port=${1##*:} out end_epoch days proto verify
+  if ! out=$(timeout "$TIMEOUT" openssl s_client -connect "$host:$port" -servername "$host" </dev/null 2>&1); then
+    add tls CRIT "$target: TLS handshake failed"
+    return
+  fi
+  proto=$(sed -nE 's/^ *Protocol *: *(.*)$/\1/p' <<<"$out" | tail -n1)
+  verify=$(sed -nE 's/^ *Verify return code: *(.*)$/\1/p' <<<"$out" | tail -n1)
+  local enddate
+  enddate=$(openssl x509 -noout -enddate 2>/dev/null <<<"$out" | sed 's/^notAfter=//') || true
+  if [[ -n $enddate ]] && end_epoch=$(date -d "$enddate" +%s 2>/dev/null); then
+    days=$(((end_epoch - $(date +%s)) / 86400))
+    if (( days < 0 )); then
+      add tls CRIT "$target: certificate expired $((-days)) days ago ($enddate)"
+    elif (( days < CERT_WARN_DAYS )); then
+      add tls WARN "$target: certificate expires in $days days ($enddate)"
+    else
+      add tls OK "$target: certificate valid for $days days"
+    fi
+  else
+    add tls WARN "$target: could not read the server certificate"
+  fi
+  case $proto in
+    TLSv1.3 | TLSv1.2) add tls OK "$target: negotiated $proto" ;;
+    "") add tls WARN "$target: protocol not reported" ;;
+    *) add tls CRIT "$target: negotiated legacy protocol $proto" ;;
+  esac
+  if [[ -n $verify && $verify != "0 (ok)" ]]; then
+    add tls WARN "$target: certificate verification failed: $verify"
+  fi
+  local legacy
+  for legacy in tls1 tls1_1; do
+    if timeout "$TIMEOUT" openssl s_client -connect "$host:$port" -servername "$host" "-$legacy" \
+      -cipher 'DEFAULT:@SECLEVEL=0' </dev/null >/dev/null 2>&1; then
+      add tls WARN "$target: still accepts $([[ $legacy == tls1 ]] && echo "TLS 1.0" || echo "TLS 1.1")"
+    fi
+  done
+}
+
+check_tls() {
+  if (( ${#TLS_TARGETS[@]} == 0 )); then
+    add tls INFO "no --tls HOST:PORT targets given"
+    return
+  fi
+  have openssl || { add tls INFO "openssl not available"; return; }
+  local t
+  for t in "${TLS_TARGETS[@]}"; do check_tls_target "$t"; done
+}
+
+# key  expected  severity-if-different  description
+SYSCTL_RULES=(
+  "net.ipv4.ip_forward|0|WARN|IPv4 forwarding disabled (not a router)"
+  "net.ipv6.conf.all.forwarding|0|WARN|IPv6 forwarding disabled (not a router)"
+  "net.ipv4.conf.all.accept_redirects|0|WARN|ignore ICMP redirects (MITM)"
+  "net.ipv4.conf.default.accept_redirects|0|WARN|ignore ICMP redirects on new interfaces"
+  "net.ipv6.conf.all.accept_redirects|0|WARN|ignore ICMPv6 redirects"
+  "net.ipv4.conf.all.secure_redirects|0|INFO|ignore 'secure' redirects from gateways"
+  "net.ipv4.conf.all.send_redirects|0|WARN|do not send ICMP redirects"
+  "net.ipv4.conf.all.accept_source_route|0|WARN|reject source-routed packets"
+  "net.ipv6.conf.all.accept_source_route|0|WARN|reject source-routed IPv6 packets"
+  "net.ipv4.conf.all.rp_filter|1,2|WARN|reverse path filtering (anti-spoofing)"
+  "net.ipv4.tcp_syncookies|1|WARN|SYN flood protection"
+  "net.ipv4.icmp_echo_ignore_broadcasts|1|WARN|ignore broadcast pings (smurf)"
+  "net.ipv4.icmp_ignore_bogus_error_responses|1|INFO|ignore bogus ICMP errors"
+  "net.ipv4.conf.all.log_martians|1|INFO|log packets with impossible addresses"
+)
+
+check_sysctl() {
+  local rule key expected sev desc file value bad=0
+  for rule in "${SYSCTL_RULES[@]}"; do
+    IFS='|' read -r key expected sev desc <<<"$rule"
+    file="$PROC_SYS/${key//.//}"
+    if [[ ! -r $file ]]; then
+      continue
+    fi
+    value=$(tr -d '[:space:]' <"$file")
+    if [[ ",$expected," == *",$value,"* ]]; then
+      continue
+    fi
+    if (( ALLOW_FORWARDING )) && [[ $key == *forwarding || $key == *ip_forward ]]; then
+      add sysctl INFO "$key = $value (forwarding allowed by --allow-forwarding)"
+      continue
+    fi
+    bad=1
+    add sysctl "$sev" "$key = $value, expected ${expected//,/ or }: $desc"
+  done
+  (( bad )) || add sysctl OK "network sysctl hardening as expected (${#SYSCTL_RULES[@]} keys)"
+}
+
+# ---- output ----------------------------------------------------------------------
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  printf '"%s"' "$(printf '%s' "$s" | tr -d '\000-\010\013-\037')"
+}
+
+overall() {
+  local i worst=OK
+  for i in "${!F_SEV[@]}"; do
+    if (( $(sev_rank "${F_SEV[i]}") > $(sev_rank "$worst") )); then worst=${F_SEV[i]}; fi
+  done
+  echo "$worst"
+}
+
+output_text() {
+  local c i st
+  printf '%s %s on %s  (%s)\n\n' "$PROG" "$VERSION" "$(hostname 2>/dev/null || echo localhost)" "$(date '+%Y-%m-%d %H:%M %Z')"
+  for c in $CHECKS; do
+    st=$(check_status "$c")
+    printf '[%-4s] %s\n' "$st" "$c"
+    for i in "${!F_CHECK[@]}"; do
+      [[ ${F_CHECK[i]} == "$c" ]] || continue
+      printf '       %-4s %s\n' "${F_SEV[i]}" "${F_MSG[i]}"
+    done
+    if [[ $c == ports && ${#L_PORT[@]} -gt 0 ]]; then
+      printf '       %-5s %-28s %-6s %-9s %s\n' PROTO ADDRESS PORT SCOPE PROCESS
+      for i in "${!L_PORT[@]}"; do
+        printf '       %-5s %-28s %-6s %-9s %s\n' "${L_PROTO[i]}" "${L_ADDR[i]}" "${L_PORT[i]}" "${L_SCOPE[i]}" "${L_PROC[i]}"
+      done
+    fi
+  done
+  printf '\nOVERALL: %s\n' "$(overall)"
+}
+
+output_json() {
+  local c i first
+  printf '{"tool":"net-security-check","version":%s,"host":%s,"status":%s,"exit_code":%d,"checks":[' \
+    "$(json_str "$VERSION")" "$(json_str "$(hostname 2>/dev/null || echo localhost)")" "$(json_str "$(overall)")" "$1"
+  local cfirst=1
+  for c in $CHECKS; do
+    (( cfirst )) || printf ','
+    cfirst=0
+    printf '{"check":%s,"status":%s,"findings":[' "$(json_str "$c")" "$(json_str "$(check_status "$c")")"
+    first=1
+    for i in "${!F_CHECK[@]}"; do
+      [[ ${F_CHECK[i]} == "$c" ]] || continue
+      (( first )) || printf ','
+      first=0
+      printf '{"severity":%s,"message":%s}' "$(json_str "${F_SEV[i]}")" "$(json_str "${F_MSG[i]}")"
+    done
+    printf ']'
+    if [[ $c == ports ]]; then
+      printf ',"listeners":['
+      first=1
+      for i in "${!L_PORT[@]}"; do
+        (( first )) || printf ','
+        first=0
+        printf '{"proto":%s,"address":%s,"port":%d,"scope":%s,"process":%s}' "$(json_str "${L_PROTO[i]}")" \
+          "$(json_str "${L_ADDR[i]}")" "$((10#${L_PORT[i]}))" "$(json_str "${L_SCOPE[i]}")" "$(json_str "${L_PROC[i]}")"
+      done
+      printf ']'
+    fi
+    printf '}'
+  done
+  printf ']}\n'
+}
+
+main() {
+  parse_args "$@"
+  [[ $FORMAT == json ]] || print_banner
+  validate_args
+  local c
+  for c in $CHECKS; do
+    "check_$c"
+  done
+  local rc
+  case $(overall) in CRIT) rc=2 ;; WARN) rc=1 ;; *) rc=0 ;; esac
+  if [[ $FORMAT == json ]]; then output_json "$rc"; else output_text; fi
+  exit "$rc"
+}
+
+main "$@"

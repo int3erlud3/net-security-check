@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# openssl mock for the TLS check.
+#   s_client           prints $MOCK_FIXTURES/s_client.out, exit $MOCK_TLS_RC (default 0)
+#   s_client -tls1*    legacy protocol probe: exit $MOCK_TLS_LEGACY_RC (default 1 = rejected)
+#   x509 -enddate      prints notAfter=$MOCK_CERT_END
+case $1 in
+  s_client)
+    for a in "$@"; do
+      [[ $a == -tls1 || $a == -tls1_1 ]] && exit "${MOCK_TLS_LEGACY_RC:-1}"
+    done
+    cat "$MOCK_FIXTURES/s_client.out" 2>/dev/null
+    exit "${MOCK_TLS_RC:-0}" ;;
+  x509)
+    cat >/dev/null
+    [[ -n ${MOCK_CERT_END:-} ]] || exit 1
+    echo "notAfter=$MOCK_CERT_END" ;;
+  *) exit 1 ;;
+esac

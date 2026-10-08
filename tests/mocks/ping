@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# ping mock: succeeds when the payload (-s SIZE) + 28 bytes of headers fits $MOCK_PMTU.
+size=56
+while [[ $# -gt 0 ]]; do
+  [[ $1 == -s ]] && { size=$2; shift; }
+  shift
+done
+[[ -n ${MOCK_PMTU:-} ]] && (( size + 28 <= MOCK_PMTU ))

@@ -1,0 +1,15 @@
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:CN = www.example.test
+   i:C = US, O = Example CA, CN = Example Issuing CA
+---
+Server certificate
+(PEM block omitted in this fixture; certificate parsing is mocked)
+---
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+SSL-Session:
+    Protocol  : TLSv1.3
+    Cipher    : TLS_AES_256_GCM_SHA384
+    Verify return code: 0 (ok)
+---

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Generic command mock. Symlink it under the name of the command to fake.
+# Output is read from $MOCK_FIXTURES:
+#   <name>__<args>.out / .rc / .err   for a specific argument list (non-alnum -> _)
+#   <name>.out / .rc / .err           fallback for any arguments
+name=${0##*/}
+key="${name}__$(printf '%s_' "$@" | tr -c 'A-Za-z0-9\n' '_')"
+key=${key%_}
+base="$MOCK_FIXTURES/$name"
+[[ -e "$MOCK_FIXTURES/$key.out" || -e "$MOCK_FIXTURES/$key.rc" ]] && base="$MOCK_FIXTURES/$key"
+printf '%s %s\n' "$name" "$*" >>"$MOCK_FIXTURES/calls.log"
+[[ -e "$base.out" ]] && cat "$base.out"
+[[ -e "$base.err" ]] && cat "$base.err" >&2
+exit "$(cat "$base.rc" 2>/dev/null || echo 0)"
